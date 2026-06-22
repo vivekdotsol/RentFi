@@ -13,16 +13,10 @@ declare_id!("Fi7mt4CqYE158ULufrx818hKLPKC8Jaz51o8rAZeaJWg");
 pub mod rentfi {
     use super::*;
 
-    /// Step 1 — Landlord registers a lease on-chain.
-    /// An attestation PDA is created that stores lease metadata and a hash
-    /// of the off-chain document (IPFS CID or SHA-256).
     pub fn register_lease(ctx: Context<RegisterLease>, params: RegisterLeaseParams) -> Result<()> {
         instructions::register_lease::handler(ctx, params)
     }
 
-    /// Step 2 — Landlord initialises a vault + mints RST tokens.
-    /// The vault holds all incoming rent payments.
-    /// RST SPL tokens represent pro-rata claims on vault income.
     pub fn initialize_vault(
         ctx: Context<InitializeVault>,
         params: InitializeVaultParams,
