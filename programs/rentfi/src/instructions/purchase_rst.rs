@@ -75,48 +75,52 @@ pub struct PurchaseRst<'info> {
 }
 
 pub fn handler(ctx: Context<PurchaseRst>, usdc_amount: u64) -> Result<()> {
-    let vault = &mut ctx.accounts.vault;
+    let vault_key = ctx.accounts.vault.key();
+    let lease_key = ctx.accounts.vault.lease;
+    let vault_bump = ctx.accounts.vault.bump;
+    let rst_price = ctx.accounts.vault.rst_price_usdc;
+    let global_ypt = ctx.accounts.vault.yield_per_token_cumulative;
 
-    // Validate purchase amount is exact multiple of RST price
     require!(
-        usdc_amount % vault.rst_price_usdc == 0,
+        usdc_amount % rst_price == 0,
         RentFiError::InvalidPurchaseAmount
     );
 
     let rst_amount = usdc_amount
-        .checked_div(vault.rst_price_usdc)
+        .checked_div(rst_price)
         .ok_or(RentFiError::Overflow)?;
 
-    // Check vault has enough unsold RSTs
     require!(
         ctx.accounts.vault_rst_account.amount >= rst_amount,
         RentFiError::InsufficientRstSupply
     );
 
-    // --- Settle any pending yield for this investor BEFORE updating balance ---
-    let position = &mut ctx.accounts.investor_position;
-    if position.rst_balance > 0 {
-        let pending = pending_yield(
-            position.rst_balance,
-            vault.yield_per_token_cumulative,
-            position.yield_per_token_snapshot,
-        )?;
-        position.total_claimed = position
-            .total_claimed
-            .checked_add(pending)
-            .ok_or(RentFiError::Overflow)?;
-        // NOTE: actual USDC transfer of pending yield happens via claim_yield;
-        // here we just advance the snapshot to prevent double-counting.
-    }
-    position.yield_per_token_snapshot = vault.yield_per_token_cumulative;
-    position.vault = vault.key();
-    position.investor = ctx.accounts.investor.key();
-    position.rst_balance = position
-        .rst_balance
-        .checked_add(rst_amount)
-        .ok_or(RentFiError::Overflow)?;
+    {
+        let position = &mut ctx.accounts.investor_position;
 
-    // 1. Transfer USDC from investor → usdc_vault
+        if position.rst_balance > 0 {
+            let pending = pending_yield(
+                position.rst_balance,
+                global_ypt,
+                position.yield_per_token_snapshot,
+            )?;
+
+            position.total_claimed = position
+                .total_claimed
+                .checked_add(pending)
+                .ok_or(RentFiError::Overflow)?;
+        }
+
+        position.yield_per_token_snapshot = global_ypt;
+        position.vault = vault_key;
+        position.investor = ctx.accounts.investor.key();
+        position.rst_balance = position
+            .rst_balance
+            .checked_add(rst_amount)
+            .ok_or(RentFiError::Overflow)?;
+    }
+
+    // Transfer USDC
     anchor_spl::token::transfer(
         CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
@@ -129,12 +133,9 @@ pub fn handler(ctx: Context<PurchaseRst>, usdc_amount: u64) -> Result<()> {
         usdc_amount,
     )?;
 
-    // 2. Transfer RST from vault_rst_account → investor_rst_account
-    let lease_key = vault.lease;
-    let vault_bump = vault.bump;
-    let vault_seeds: &[&[u8]] = &[b"vault", lease_key.as_ref(), &[vault_bump]];
-    let signer_seeds = &[vault_seeds];
+    let signer_seeds: &[&[u8]] = &[b"vault", lease_key.as_ref(), &[vault_bump]];
 
+    // Transfer RST
     anchor_spl::token::transfer(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
@@ -143,28 +144,20 @@ pub fn handler(ctx: Context<PurchaseRst>, usdc_amount: u64) -> Result<()> {
                 to: ctx.accounts.investor_rst_account.to_account_info(),
                 authority: ctx.accounts.vault.to_account_info(),
             },
-            signer_seeds,
+            &[signer_seeds],
         ),
         rst_amount,
     )?;
 
     emit!(RstPurchased {
-        vault: vault.key(),
+        vault: vault_key,
         investor: ctx.accounts.investor.key(),
         rst_amount,
         usdc_paid: usdc_amount,
     });
 
-    msg!(
-        "RentFi: {} RST purchased by {} for {} USDC micro",
-        rst_amount,
-        ctx.accounts.investor.key(),
-        usdc_amount
-    );
-
     Ok(())
 }
-
 /// Compute pending yield for an investor using the global accumulator pattern.
 pub fn pending_yield(balance: u64, global_ypt: u128, snapshot_ypt: u128) -> Result<u64> {
     let delta = global_ypt.saturating_sub(snapshot_ypt);
